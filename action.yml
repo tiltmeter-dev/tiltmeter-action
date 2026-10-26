@@ -1,11 +1,19 @@
 name: Tiltmeter API drift check
-description: Detect breaking changes in the third-party APIs your code and AI agents depend on.
+description: Detect breaking changes in the third-party APIs your code and AI agents depend on, and apply the changes API providers announce.
 author: Agustin Torres
 branding:
   icon: activity
   color: orange
 
 inputs:
+  mode:
+    description: >-
+      "check" checks the endpoints in the config for drift. "notices" reads the change
+      notices and specs the config subscribes to and opens a pull request for each change
+      that affects this repository. For API providers, "notice-draft" comments a draft
+      notice on pull requests that change the spec's responses, and "notice-publish" signs
+      the notices in notices-dir into the feed in site-dir.
+    default: check
   config:
     description: Path to tiltmeter.yaml, relative to the workspace.
     default: tiltmeter.yaml
@@ -15,6 +23,12 @@ inputs:
   version:
     description: Tiltmeter version to run from PyPI. Pin it so a new release never changes your CI without a review.
     default: "0.5.0"
+  source:
+    description: >-
+      Install Tiltmeter from here instead of PyPI, such as
+      git+https://github.com/tiltmeter-dev/tiltmeter@main, to try a change before it is
+      released. Overrides version.
+    default: ""
   fail-on:
     description: >-
       When to fail the step. "warning" fails on warning or breaking drift and on checks that
@@ -36,16 +50,52 @@ inputs:
   summary:
     description: Write the results to the job summary.
     default: "true"
+  agent:
+    description: >-
+      With mode "notices": the agent that edits the code, deepagents, claude-code or codex.
+      Empty uses fix.agent from the config.
+    default: ""
+  token:
+    description: >-
+      The token gh uses: to open pull requests with mode "notices", and to comment with
+      mode "notice-draft". Pull requests opened with the default GITHUB_TOKEN do not
+      trigger other workflows; pass a GitHub App or fine-grained token to have your CI run
+      on them.
+    default: ${{ github.token }}
+  spec:
+    description: With mode "notice-draft", the path of your OpenAPI spec in the repository.
+    default: ""
+  base-url:
+    description: >-
+      With mode "notice-draft", the URL your paths start from, when the spec's first server
+      is relative or templated.
+    default: ""
+  notices-dir:
+    description: Where the provider keeps its notices, one JSON file each.
+    default: notices
+  site-dir:
+    description: >-
+      With mode "notice-publish", the folder your site is served from. The feed is written
+      to its .well-known/api-changes.json, next to the api-change-key you commit there.
+    default: site
+  require-notice:
+    description: >-
+      With mode "notice-draft", fail the step when the pull request changes the spec's
+      responses but adds no notice to notices-dir.
+    default: "false"
 
 outputs:
   exit-code:
-    description: "Tiltmeter's exit code: 0 clean, 1 warning, 2 breaking, 3 a check failed, 4 configuration error."
+    description: "Tiltmeter's exit code: 0 clean, 1 warning, 2 breaking, 3 a check or a fix failed, 4 configuration error."
     value: ${{ steps.check.outputs.exit-code }}
   result:
     description: "One word for the run: clean, warning, breaking, failed or error."
     value: ${{ steps.check.outputs.result }}
   json:
-    description: Path to the JSON results, one check result per endpoint.
+    description: >-
+      Path to the JSON results: one check result per endpoint; with mode "notices", the
+      feeds and what was done about each new notice; with "notice-draft", the draft
+      notice (empty when nothing changed); with "notice-publish", the feed.
     value: ${{ steps.check.outputs.json }}
 
 runs:
@@ -54,43 +104,140 @@ runs:
     - name: Set up uv
       uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
 
+    - name: Pick the Tiltmeter to run
+      id: tool
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        SOURCE: ${{ inputs.source }}
+      run: |
+        if [ -n "$SOURCE" ]; then
+          echo "package=tiltmeter @ $SOURCE" >> "$GITHUB_OUTPUT"
+          echo "fix-package=tiltmeter[fix] @ $SOURCE" >> "$GITHUB_OUTPUT"
+        else
+          echo "package=tiltmeter==$VERSION" >> "$GITHUB_OUTPUT"
+          echo "fix-package=tiltmeter[fix]==$VERSION" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Locate the baseline
       id: state
       shell: bash
       env:
         CONFIG: ${{ inputs.config }}
-        VERSION: ${{ inputs.version }}
+        PACKAGE: ${{ steps.tool.outputs.package }}
       run: |
-        uvx --quiet --from "tiltmeter==$VERSION" python "$GITHUB_ACTION_PATH/action.py" state-dir "$CONFIG" >> "$GITHUB_OUTPUT"
+        uvx --quiet --from "$PACKAGE" python "$GITHUB_ACTION_PATH/action.py" state-dir "$CONFIG" >> "$GITHUB_OUTPUT"
 
     - name: Restore the baseline
-      if: inputs.cache == 'true'
+      if: inputs.cache == 'true' && !startsWith(inputs.mode, 'notice-')
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.state.outputs.dir }}
         key: ${{ inputs.cache-key }}-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
         restore-keys: ${{ inputs.cache-key }}-${{ github.job }}-
 
-    - name: Check APIs
+    - name: Run Tiltmeter
       id: check
       shell: bash
       env:
         PYTHONUTF8: "1"
+        MODE: ${{ inputs.mode }}
         CONFIG: ${{ inputs.config }}
         ENDPOINTS: ${{ inputs.endpoints }}
-        VERSION: ${{ inputs.version }}
+        PACKAGE: ${{ steps.tool.outputs.package }}
+        FIX_PACKAGE: ${{ steps.tool.outputs.fix-package }}
         EXPLAIN: ${{ inputs.explain }}
         NOTIFY: ${{ inputs.notify }}
         SUMMARY: ${{ inputs.summary }}
+        AGENT: ${{ inputs.agent }}
+        GH_TOKEN: ${{ inputs.token }}
+        SPEC: ${{ inputs.spec }}
+        NOTICES_DIR: ${{ inputs.notices-dir }}
+        SITE_DIR: ${{ inputs.site-dir }}
+        REQUIRE_NOTICE: ${{ inputs.require-notice }}
+        BASE_URL: ${{ inputs.base-url }}
       run: |
-        args=(check --json --config "$CONFIG")
-        for id in $ENDPOINTS; do args+=(--endpoint "$id"); done
-        [ "$EXPLAIN" = "true" ] || args+=(--no-llm)
-        [ "$NOTIFY" = "true" ] || args+=(--no-notify)
-
         json="$RUNNER_TEMP/tiltmeter-results.json"
-        code=0
-        uvx --quiet --from "tiltmeter==$VERSION" tiltmeter "${args[@]}" > "$json" || code=$?
+        package="$PACKAGE"
+        summary_command=summary
+        tool() { uvx --quiet --from "$package" "$@"; }
+        helper() { tool python "$GITHUB_ACTION_PATH/action.py" "$@"; }
+        case "$MODE" in
+          check)
+            args=(check --json --config "$CONFIG")
+            for id in $ENDPOINTS; do args+=(--endpoint "$id"); done
+            [ "$EXPLAIN" = "true" ] || args+=(--no-llm)
+            [ "$NOTIFY" = "true" ] || args+=(--no-notify)
+            ;;
+          notices)
+            args=(notices apply --yes --json --config "$CONFIG" --repo .)
+            [ -n "$AGENT" ] && args+=(--agent "$AGENT")
+            # The built-in agent needs the fix extra; Claude Code and Codex do not.
+            case "$AGENT" in
+              claude-code|codex) ;;
+              *) package="$FIX_PACKAGE" ;;
+            esac
+            # Commits need an identity; use the Actions bot unless the job set one.
+            if ! git config user.email >/dev/null; then
+              export GIT_AUTHOR_NAME="github-actions[bot]" GIT_COMMITTER_NAME="github-actions[bot]"
+              export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+              export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+            fi
+            summary_command=notices-summary
+            ;;
+          notice-draft)
+            [ -n "$SPEC" ] || { echo "::error::mode notice-draft needs the spec input"; exit 4; }
+            [ -n "${GITHUB_BASE_REF:-}" ] || { echo "::error::mode notice-draft runs on pull_request events"; exit 4; }
+            git fetch --quiet --no-tags --depth=1 origin "$GITHUB_BASE_REF" || true
+            old="$RUNNER_TEMP/tiltmeter-base-spec"
+            json="$RUNNER_TEMP/tiltmeter-draft.json"
+            rm -f "$json"
+            code=0
+            if git show "origin/$GITHUB_BASE_REF:$SPEC" > "$old" 2>/dev/null; then
+              create=(notice create --from-openapi "$old" "$SPEC" --if-changed --force -o "$json")
+              [ -n "$BASE_URL" ] && create+=(--base-url "$BASE_URL")
+              tool tiltmeter "${create[@]}" || code=$?
+            else
+              echo "$SPEC is new in this pull request: nothing to compare yet."
+            fi
+            if [ "$code" = "0" ]; then
+              comment="$RUNNER_TEMP/tiltmeter-comment.md"
+              helper draft-comment "$json" "$SPEC" "$NOTICES_DIR" "$comment"
+              helper upsert-comment "$comment" || echo "::warning::could not comment on the pull request"
+              if [ -s "$json" ] && [ "$REQUIRE_NOTICE" = "true" ]; then
+                if [ -z "$(git diff --name-only "origin/$GITHUB_BASE_REF" HEAD -- "$NOTICES_DIR")" ]; then
+                  echo "::error::This pull request changes API responses; add a notice to $NOTICES_DIR (see the comment)."
+                  code=1
+                fi
+              fi
+            fi
+            [ -s "$json" ] || json=""
+            summary_command=""
+            ;;
+          notice-publish)
+            json="$SITE_DIR/.well-known/api-changes.json"
+            shopt -s nullglob
+            notices=("$NOTICES_DIR"/*.json)
+            shopt -u nullglob
+            code=0
+            if [ "${#notices[@]}" = "0" ]; then
+              echo "No notices in $NOTICES_DIR."
+            else
+              # The key, when set, comes from the TILTMETER_SIGNING_KEY secret in env: never an argument.
+              tool tiltmeter notice publish "${notices[@]}" --feed "$json" --replace || code=$?
+            fi
+            summary_command=""
+            ;;
+          *)
+            echo "::error::mode must be check, notices, notice-draft or notice-publish, got '$MODE'"
+            exit 4
+            ;;
+        esac
+
+        if [ "$MODE" = "check" ] || [ "$MODE" = "notices" ]; then
+          code=0
+          tool tiltmeter "${args[@]}" > "$json" || code=$?
+        fi
 
         case "$code" in
           0) result=clean ;;
@@ -107,10 +254,12 @@ runs:
 
         summary_file=""
         [ "$SUMMARY" = "true" ] && summary_file="$GITHUB_STEP_SUMMARY"
-        uvx --quiet --from "tiltmeter==$VERSION" python "$GITHUB_ACTION_PATH/action.py" summary "$json" "$code" "$summary_file"
+        if [ -n "$summary_command" ]; then
+          helper "$summary_command" "$json" "$code" "$summary_file"
+        fi
 
     - name: Save the baseline
-      if: always() && inputs.cache == 'true' && steps.check.outputs.exit-code != '4'
+      if: always() && inputs.cache == 'true' && !startsWith(inputs.mode, 'notice-') && steps.check.outputs.exit-code != '4'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.state.outputs.dir }}
