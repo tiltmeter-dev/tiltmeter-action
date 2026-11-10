@@ -1,1 +1,5 @@
 __pycache__/
+
+# Left by a local end-to-end run
+e2e/served/
+e2e/.tiltmeter/

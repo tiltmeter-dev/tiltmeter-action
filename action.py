@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -65,8 +66,50 @@ def _cell(value: Any) -> str:
     )
 
 
-def summary(results_path: str, code: str, summary_path: str) -> None:
-    """Print the results to the log and, when asked, write them to the job summary."""
+_UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]+")
+
+
+def _line(value: Any) -> str:
+    """Third-party text on one log line, so it cannot start a workflow command."""
+    return " ".join(_UNPRINTABLE.sub(" ", str(value or "")).split())
+
+
+def _code(value: Any) -> str:
+    """Text that may come from an API or a provider's notice, as inert inline code."""
+    return f"`{_cell(value).replace('`', "'")}`" if value else ""
+
+
+FENCE = "`" * 4
+
+
+def _fenced(text: str, language: str = "json") -> list[str]:
+    """Text in a code block that nothing inside can close."""
+    return [FENCE + language, text.replace(FENCE, "'" * 4), FENCE]
+
+
+NEW_STATE = (
+    "Nothing was restored from the Actions cache, so this run started from scratch: "
+    "{what}. That is expected on the first run. Later it means GitHub removed the cache, "
+    "which it does with entries nobody used for 7 days: schedule the workflow more often "
+    "than weekly."
+)
+
+
+def _new_state(state: str, what: str, md: list[str], log: list[str]) -> None:
+    """Say so when the cache held nothing: a run that starts over finds nothing, quietly."""
+    if state != "new":
+        return
+    message = NEW_STATE.format(what=what)
+    md += [f"> {message}", ""]
+    log.append(f"::notice title=Tiltmeter::{message}")
+
+
+def summary(results_path: str, code: str, summary_path: str, state: str = "") -> None:
+    """Print the results to the log and, when asked, write them to the job summary.
+
+    Paths, hints, errors and explanations come from the API being checked, or from a
+    model that read it: they go into the summary as code, and into the log on one line.
+    """
     try:
         results: list[dict[str, Any]] = json.loads(
             Path(results_path).read_text(encoding="utf-8")
@@ -77,6 +120,7 @@ def summary(results_path: str, code: str, summary_path: str) -> None:
     verdict = VERDICTS.get(int(code), f"Exit code {code}.")
     md = ["## Tiltmeter", "", f"**{verdict}** Exit code `{code}`.", ""]
     log = [f"Tiltmeter: {verdict} (exit code {code})"]
+    _new_state(state, "it recorded a new baseline and could not report drift", md, log)
 
     if results:
         md += ["| Endpoint | Status | Result | Changes |", "|---|---|---|---|"]
@@ -88,19 +132,20 @@ def summary(results_path: str, code: str, summary_path: str) -> None:
             )
             status = r.get("status_code") or "—"
             md.append(
-                f"| `{_cell(r['endpoint_id'])}` | {status} | {_cell(label)} | {len(r['changes'])} |"
+                f"| {_code(r['endpoint_id'])} | {status} | {_cell(label)} | {len(r['changes'])} |"
             )
             log.append(
-                f"  {r['endpoint_id']}: {severity or outcome}, {len(r['changes'])} changes"
+                f"  {_line(r['endpoint_id'])}: {severity or outcome}, {len(r['changes'])} changes"
             )
 
         for r in results:
-            if not r["changes"] and not r.get("error"):
+            notes = r.get("notes") or []
+            if not r["changes"] and not r.get("error") and not notes:
                 continue
-            md += ["", f"### `{_cell(r['endpoint_id'])}`", ""]
+            md += ["", f"### {_code(r['endpoint_id'])}", ""]
             if r.get("error"):
-                md.append(f"> {_cell(r['error'])}")
-                log.append(f"  {r['endpoint_id']}: {r['error']}")
+                md.append(f"> {_code(r['error'])}")
+                log.append(f"  {_line(r['endpoint_id'])}: {_line(r['error'])}")
             if r["changes"]:
                 md += [
                     "| Severity | Change | Path | Before | After | Note |",
@@ -109,20 +154,27 @@ def summary(results_path: str, code: str, summary_path: str) -> None:
                 for c in r["changes"]:
                     md.append(
                         f"| {ICONS.get(c['severity'], '')} {c['severity']} | {c['kind']} "
-                        f"| `{_cell(c['path'])}` | {_cell(c.get('before'))} | {_cell(c.get('after'))} "
-                        f"| {_cell(c.get('hint'))} |"
+                        f"| {_code(c['path'])} | {_code(c.get('before'))} | {_code(c.get('after'))} "
+                        f"| {_code(c.get('hint'))} |"
                     )
-                    log.append(f"    {c['severity']:<8} {c['message']}")
+                    log.append(f"    {c['severity']:<8} {_line(c['message'])}")
             explanation = r.get("explanation")
             if explanation:
+                told = [
+                    f"What changed: {explanation['summary']}",
+                    f"Impact: {explanation['impact']}",
+                    f"Next step: {explanation['suggested_action']}",
+                ]
+                wrapped = "\n".join(textwrap.fill(_line(part), 100) for part in told)
                 md += [
                     "",
-                    f"**What changed.** {explanation['summary']}",
+                    "The explanation, as plain text:",
                     "",
-                    f"**Impact.** {explanation['impact']}",
-                    "",
-                    f"**Next step.** {explanation['suggested_action']}",
+                    *_fenced(wrapped, "text"),
                 ]
+            if notes:
+                md += ["", *(f"- {_code(note)}" for note in notes)]
+                log += [f"    note     {_line(note)}" for note in notes]
 
     print("\n".join(log))
     if summary_path:
@@ -130,20 +182,9 @@ def summary(results_path: str, code: str, summary_path: str) -> None:
             fh.write("\n".join(md) + "\n")
 
 
-_UNPRINTABLE = re.compile(r"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]+")
-
-
-def _line(value: Any) -> str:
-    """Third-party text on one log line, so it cannot start a workflow command."""
-    return " ".join(_UNPRINTABLE.sub(" ", str(value or "")).split())
-
-
-def _code(value: Any) -> str:
-    """Text that may come from a provider's notice, as inert inline code."""
-    return f"`{_cell(value).replace('`', "'")}`" if value else ""
-
-
-def notices_summary(results_path: str, code: str, summary_path: str) -> None:
+def notices_summary(
+    results_path: str, code: str, summary_path: str, state: str = ""
+) -> None:
     """Print what `tiltmeter notices apply` did and, when asked, write it to the job summary."""
     try:
         data: dict[str, Any] = json.loads(
@@ -154,6 +195,7 @@ def notices_summary(results_path: str, code: str, summary_path: str) -> None:
     verdict = NOTICE_VERDICTS.get(int(code), f"Exit code {code}.")
     md = ["## Tiltmeter notices", "", f"**{verdict}** Exit code `{code}`.", ""]
     log = [f"Tiltmeter notices: {verdict} (exit code {code})"]
+    _new_state(state, "it has no record of the notices already handled", md, log)
 
     for feed in data.get("feeds", []):
         if feed.get("error"):
@@ -201,12 +243,6 @@ def notices_summary(results_path: str, code: str, summary_path: str) -> None:
 
 MARKER = "<!-- tiltmeter-notice-draft -->"
 DOCS = "https://github.com/tiltmeter-dev/tiltmeter/blob/main/docs/notices.md"
-FENCE = "`" * 4
-
-
-def _fenced(text: str) -> list[str]:
-    """Text in a code block that nothing inside can close."""
-    return [FENCE + "json", text.replace(FENCE, "'" * 4), FENCE]
 
 
 def draft_comment(draft_path: str, spec: str, notices_dir: str, out_path: str) -> None:

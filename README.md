@@ -41,6 +41,11 @@ jobs:
 The first run records a baseline. Later runs report each change once, then fold it into
 the baseline.
 
+The baseline lives in the Actions cache, and GitHub removes cache entries that nobody
+used for 7 days. Schedule the workflow more often than weekly: a run that finds no
+baseline records a new one and cannot report drift. It says so in the job summary and in
+a notice on the run, which is expected only the first time.
+
 ## Provider notices
 
 When the APIs you call publish [change notices](https://github.com/tiltmeter-dev/tiltmeter/blob/main/docs/notices.md),
@@ -150,7 +155,8 @@ jobs:
 - **`notice-draft`** compares the spec with the pull request's base branch and keeps one
   comment on the pull request with the changes and a draft notice. Save the draft in
   `notices/`, review its summary and notes, and merge. With `require-notice: true`, the
-  step fails while the pull request changes responses without adding a notice. Pull
+  step fails while the pull request changes responses without adding a notice, whatever
+  `fail-on` says. Pull
   requests from forks get a read-only token, so they get no comment.
 - **`notice-publish`** signs every notice in `notices/` with the `TILTMETER_SIGNING_KEY`
   secret (the PEM itself) into `site/.well-known/api-changes.json`, checking each signature
@@ -167,12 +173,12 @@ jobs:
 | `endpoints` | all | Endpoint ids to check, separated by spaces or new lines. |
 | `version` | `0.8.0` | Tiltmeter version from PyPI. |
 | `source` | none | Run Tiltmeter from here instead of PyPI, such as `git+https://github.com/tiltmeter-dev/tiltmeter@main`. Overrides `version`. |
-| `fail-on` | `warning` | `warning` fails on warning or breaking drift and on checks that could not run. `breaking` fails only on breaking drift. `never` only reports. A broken config always fails. |
+| `fail-on` | `warning` | `warning` fails on warning or breaking drift and on checks that could not run. `breaking` fails only on breaking drift. `never` only reports. A broken config always fails. The provider modes have no drift to grade: with `notice-draft` and `notice-publish`, anything that goes wrong fails the step. |
 | `explain` | `true` | Ask Claude to explain drift. Needs `ANTHROPIC_API_KEY`; without it the check runs without explanations. |
 | `notify` | `true` | Send the Slack and webhook notifications declared in the config. |
 | `cache` | `true` | Keep the baseline in the Actions cache. Without it nothing is ever reported. |
-| `cache-key` | `tiltmeter` | Cache key prefix. Change it when one job checks several independent configs. |
-| `summary` | `true` | Write the results to the job summary. |
+| `cache-key` | `tiltmeter` | Cache key prefix. Change it when one job checks several independent configs, or to start over from a new baseline. |
+| `summary` | `true` | Write the results to the job summary: the changes of each endpoint, the explanation and notes such as a notification that failed. Text that comes from the API is shown as code. |
 | `agent` | config's `fix.agent` | With `mode: notices`: `deepagents`, `claude-code` or `codex`. The default agent needs `ANTHROPIC_API_KEY`; the other two need their CLI on the runner. |
 | `token` | `github.token` | The token `gh` uses: to open pull requests with `mode: notices`, and to comment with `mode: notice-draft`. |
 | `spec` | none | With `mode: notice-draft`: the path of your OpenAPI spec. |
@@ -214,6 +220,7 @@ Use them to react in later steps, for example to open an issue on breaking drift
   time. They are never written to the cache, the summary or the logs. The cache holds only
   response shapes.
 - **Schedules.** GitHub runs `cron` in UTC and can delay busy hours; avoid minute `0`.
+  Run more often than weekly, or the cache that holds the baseline expires.
 
 ## License
 

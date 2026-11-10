@@ -1,0 +1,6 @@
+# The config of the action's end-to-end run (.github/workflows/ci.yml): one endpoint of
+# the local API that e2e/api.py serves.
+endpoints:
+  - id: customer
+    url: http://127.0.0.1:8765/customer.json
+    retries: 0

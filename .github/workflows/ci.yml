@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - run: uv run --no-project --python 3.13 --with pyyaml python -m unittest -v test_action
+
+  # The action itself, against an API on localhost: a first run records the baseline, the
+  # API renames a field, and a second run has to report it and fail.
+  e2e:
+    name: Run the action (${{ matrix.os }}, Tiltmeter ${{ matrix.tiltmeter }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    # Tiltmeter's main branch tells early that a change there breaks the action. It is
+    # not released yet, so it does not block.
+    continue-on-error: ${{ matrix.tiltmeter == 'main' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        tiltmeter: [released]
+        include:
+          - os: ubuntu-latest
+            tiltmeter: main
+    env:
+      SOURCE: ${{ matrix.tiltmeter == 'main' && 'git+https://github.com/tiltmeter-dev/tiltmeter@main' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Serve an API on localhost
+        shell: bash
+        run: uv run --no-project python e2e/api.py start
+
+      # Without the cache the baseline stays in the workspace, so each run finds the
+      # one before it whatever the cache service does.
+      - name: "First run: record the baseline"
+        id: first
+        uses: ./
+        with:
+          config: e2e/tiltmeter.yaml
+          cache: "false"
+          explain: "false"
+          source: ${{ env.SOURCE }}
+      - name: The first run is clean
+        shell: bash
+        env:
+          RESULT: ${{ steps.first.outputs.result }}
+          CODE: ${{ steps.first.outputs.exit-code }}
+          JSON: ${{ steps.first.outputs.json }}
+        run: uv run --no-project python e2e/expect.py clean 0
+
+      - name: The API renames a field
+        shell: bash
+        run: uv run --no-project python e2e/api.py drift
+      - name: "Second run: report the drift and fail"
+        id: second
+        continue-on-error: true
+        uses: ./
+        with:
+          config: e2e/tiltmeter.yaml
+          cache: "false"
+          explain: "false"
+          fail-on: breaking
+          source: ${{ env.SOURCE }}
+      - name: The second run failed on breaking drift
+        shell: bash
+        env:
+          RESULT: ${{ steps.second.outputs.result }}
+          CODE: ${{ steps.second.outputs.exit-code }}
+          JSON: ${{ steps.second.outputs.json }}
+          OUTCOME: ${{ steps.second.outcome }}
+        run: uv run --no-project python e2e/expect.py breaking 2 --outcome failure --change field_removed '$.phone'
+
+      # The defaults, cache included: the drift is part of the baseline by now.
+      - name: "Third run: nothing new, with the cache"
+        id: third
+        uses: ./
+        with:
+          config: e2e/tiltmeter.yaml
+          explain: "false"
+          cache-key: e2e-${{ matrix.os }}-${{ matrix.tiltmeter }}-${{ github.run_id }}-${{ github.run_attempt }}
+          source: ${{ env.SOURCE }}
+      - name: The third run is clean
+        shell: bash
+        env:
+          RESULT: ${{ steps.third.outputs.result }}
+          CODE: ${{ steps.third.outputs.exit-code }}
+          JSON: ${{ steps.third.outputs.json }}
+          OUTCOME: ${{ steps.third.outcome }}
+        run: uv run --no-project python e2e/expect.py clean 0 --outcome success

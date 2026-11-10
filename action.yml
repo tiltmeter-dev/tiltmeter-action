@@ -33,7 +33,8 @@ inputs:
     description: >-
       When to fail the step. "warning" fails on warning or breaking drift and on checks that
       could not run; "breaking" fails only on breaking drift; "never" only reports.
-      A broken configuration always fails.
+      A broken configuration always fails, and so does anything that goes wrong in the
+      provider modes "notice-draft" and "notice-publish", which have no drift to grade.
     default: warning
   explain:
     description: Ask Claude to explain drift. Needs ANTHROPIC_API_KEY in the step's env.
@@ -129,6 +130,7 @@ runs:
         uvx --quiet --from "$PACKAGE" python "$GITHUB_ACTION_PATH/action.py" state-dir "$CONFIG" >> "$GITHUB_OUTPUT"
 
     - name: Restore the baseline
+      id: restore
       if: inputs.cache == 'true' && !startsWith(inputs.mode, 'notice-')
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
@@ -149,6 +151,8 @@ runs:
         EXPLAIN: ${{ inputs.explain }}
         NOTIFY: ${{ inputs.notify }}
         SUMMARY: ${{ inputs.summary }}
+        CACHE: ${{ inputs.cache }}
+        RESTORED: ${{ steps.restore.outputs.cache-matched-key }}
         AGENT: ${{ inputs.agent }}
         GH_TOKEN: ${{ inputs.token }}
         SPEC: ${{ inputs.spec }}
@@ -254,8 +258,11 @@ runs:
 
         summary_file=""
         [ "$SUMMARY" = "true" ] && summary_file="$GITHUB_STEP_SUMMARY"
+        # A cache that held nothing means a run that starts over: say so, it finds nothing.
+        state=""
+        if [ "$CACHE" = "true" ] && [ -z "$RESTORED" ]; then state=new; fi
         if [ -n "$summary_command" ]; then
-          helper "$summary_command" "$json" "$code" "$summary_file"
+          helper "$summary_command" "$json" "$code" "$summary_file" "$state"
         fi
 
     - name: Save the baseline
@@ -270,12 +277,17 @@ runs:
       env:
         CODE: ${{ steps.check.outputs.exit-code }}
         FAIL_ON: ${{ inputs.fail-on }}
+        MODE: ${{ inputs.mode }}
       run: |
         case "$FAIL_ON" in
           warning)  fail="1 2 3 4" ;;
           breaking) fail="2 4" ;;
           never)    fail="4" ;;
           *) echo "::error::fail-on must be warning, breaking or never, got '$FAIL_ON'"; exit 4 ;;
+        esac
+        # The provider modes grade no drift: a missing notice or a failed publish always fails.
+        case "$MODE" in
+          notice-*) fail="1 2 3 4" ;;
         esac
         for c in $fail; do
           if [ "$CODE" = "$c" ]; then exit "$CODE"; fi
