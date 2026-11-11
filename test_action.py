@@ -206,7 +206,7 @@ class FailOn(unittest.TestCase):
         return done.returncode
 
     def test_drift_fails_the_step_as_asked(self) -> None:
-        for mode in ("check", "notices"):
+        for mode in ("check", "notices", "scan"):
             self.assertEqual(
                 [self.code(mode, "warning", c) for c in range(5)], [0, 1, 2, 3, 4]
             )
@@ -344,6 +344,327 @@ class NoticesSummary(unittest.TestCase):
         self.assertIn("[https://github.test/pr/1](https://github.test/pr/1)", text)
         self.assertIn("`[x](https://evil.test)`", text)
         self.assertNotIn("\n::error::", text)
+
+
+def finding(**extra: object) -> dict[str, object]:
+    """A catalog entry the scanned folder uses, as `tiltmeter scan --json` reports it."""
+    return {
+        "id": "groq-retired-models-2026-08",
+        "provider": "api.groq.com",
+        "headline": "Groq no longer serves 16 models it retired.",
+        "effective_at": "2026-08-16T00:00:00Z",
+        "days_left": -87,
+        "due": True,
+        "count": 1,
+        "matches": [
+            {
+                "file": "app/llm.py",
+                "line": 10,
+                "term": "llama3-8b-8192",
+                "detail": "retired; use openai/gpt-oss-20b",
+            }
+        ],
+        "fix_command": "tiltmeter fix --notice groq-retired-models-2026-08 --allow-unsigned --repo .",
+        **extra,
+    }
+
+
+def scanned(
+    report: object, code: str, fixes: object = None, folder: str = "."
+) -> tuple[str, str]:
+    """The job summary and the log that ``scan-summary`` writes."""
+    with tempfile.TemporaryDirectory() as tmp:
+        results = Path(tmp) / "scan.json"
+        results.write_text(json.dumps(report), encoding="utf-8")
+        fixes_path = ""
+        if fixes is not None:
+            fixes_path = str(Path(tmp) / "fixes.json")
+            Path(fixes_path).write_text(json.dumps(fixes), encoding="utf-8")
+        summary = Path(tmp) / "summary.md"
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):
+            action.scan_summary(str(results), code, str(summary), fixes_path, folder)
+        return summary.read_text(encoding="utf-8"), log.getvalue()
+
+
+ANNOTATION = r"::(error|warning|notice) file=[^,\n]+,line=\d+,title=Tiltmeter::[^\n]*"
+
+
+class ScanSummary(unittest.TestCase):
+    def test_a_use_gets_a_row_a_place_and_an_annotation(self) -> None:
+        md, log = scanned({"affected": [finding()], "entries": 15}, "1")
+        self.assertIn("**The code uses a known API change.** Exit code `1`.", md)
+        self.assertIn(
+            "| `api.groq.com` | `Groq no longer serves 16 models it retired.` "
+            "| in effect since 2026-08-16 | 1 |",
+            md,
+        )
+        self.assertIn(
+            "- `app/llm.py:10` `llama3-8b-8192`: `retired; use openai/gpt-oss-20b`", md
+        )
+        self.assertIn("tiltmeter fix --notice groq-retired-models-2026-08", md)
+        self.assertIn(
+            "::error file=app/llm.py,line=10,title=Tiltmeter::llama3-8b-8192: retired; "
+            "use openai/gpt-oss-20b. Groq no longer serves 16 models it retired. "
+            "(in effect since 2026-08-16)",
+            log.splitlines(),
+        )
+
+    def test_files_are_named_from_the_repository_root(self) -> None:
+        for folder in ("services/api", "./services/api/", "services\\api"):
+            md, log = scanned({"affected": [finding()]}, "1", folder=folder)
+            self.assertIn("::error file=services/api/app/llm.py,line=10,", log)
+            self.assertIn("- `services/api/app/llm.py:10`", md)
+
+    def test_a_change_ahead_warns_and_one_too_far_only_notes(self) -> None:
+        ahead = finding(id="soon", days_left=24, effective_at="2026-12-04T00:00:00Z")
+        far = finding(id="far", days_left=400, due=False)
+        md, log = scanned({"affected": [finding(), ahead, far]}, "1")
+        levels = [
+            line.split(" ", 1)[0] for line in log.splitlines() if line[:2] == "::"
+        ]
+        self.assertEqual(levels, ["::error", "::warning", "::notice"])
+        self.assertIn("| 2026-12-04, in 24 days | 1 |", md)
+        self.assertIn("(does not count yet) | 1 |", md)
+        self.assertIn("(2026-12-04, in 24 days)", log)
+
+    def test_annotations_stop_at_ten_of_a_level(self) -> None:
+        match = finding()["matches"][0]  # type: ignore[index]
+        many = [{**match, "line": line} for line in range(1, 31)]
+        md, log = scanned({"affected": [finding(matches=many, count=30)]}, "1")
+        self.assertEqual(log.count("::error file="), 10)
+        self.assertEqual(md.count("- `app/llm.py:"), 10)
+        self.assertIn("- and 20 more", md)
+
+    def test_other_peoples_text_cannot_render_or_start_a_command(self) -> None:
+        # A headline is a provider's, a line of code and a file name are the repository's.
+        hostile = finding(
+            id="x` ![i](https://evil.test/i.png) `y",
+            headline="See [docs](https://evil.test/d)\n::error::pwned\n## Approved by @octocat",
+            matches=[
+                {
+                    "file": "a,line=1::x\n::error::pwned.py",
+                    "line": 3,
+                    "term": "<img src=https://evil.test/t>",
+                    "detail": "50% off, 100%25 real\r\n::warning::pwned",
+                }
+            ],
+            fix_command="tiltmeter fix ````\n\n## Approved",
+        )
+        md, log = scanned({"affected": [hostile], "error": "bad\n::error::pwned"}, "1")
+        shown = rendered(md)
+        for live in ("evil.test", "@octocat", "<img", "## Approved"):
+            self.assertIn(live, md)
+            self.assertNotIn(live, shown)
+        headings = [line.strip() for line in shown.splitlines() if line.startswith("#")]
+        self.assertEqual(headings, ["## Tiltmeter scan", "###"])
+        commands = [line for line in log.splitlines() if line.startswith("::")]
+        self.assertEqual(len(commands), 1)
+        self.assertRegex(commands[0], f"^{ANNOTATION}$")
+        # The file name ends where the action says, and a % is no escape of the text's own.
+        self.assertIn(
+            "::error file=a%2Cline=1%3A%3Ax %3A%3Aerror%3A%3Apwned.py,line=3,", log
+        )
+        self.assertIn("50%25 off, 100%2525 real ::warning::pwned.", commands[0])
+
+    def test_a_clean_scan_says_how_much_it_checked(self) -> None:
+        md, log = scanned({"affected": [], "entries": 15}, "0")
+        self.assertIn("**The code uses no known API change.** Exit code `0`.", md)
+        self.assertIn("Checked 15 known API changes.", md)
+        self.assertNotIn("::", log)
+
+    def test_a_scan_that_printed_nothing_still_gets_its_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = Path(tmp) / "summary.md"
+            with contextlib.redirect_stdout(io.StringIO()):
+                action.scan_summary(str(Path(tmp) / "missing.json"), "4", str(summary))
+            self.assertIn("Configuration or usage error", summary.read_text("utf-8"))
+
+    def test_fixes_are_listed_with_the_link_gh_returned(self) -> None:
+        fixes = [
+            {
+                "id": "groq-retired-models-2026-08",
+                "status": "opened",
+                "detail": "https://github.test/pr/7",
+                "pr_url": "https://github.test/pr/7",
+            },
+            {"id": "other", "status": "exists", "detail": "tiltmeter/scan-other"},
+            {"id": "bad", "status": "failed", "detail": "[x](https://evil.test)"},
+        ]
+        md, log = scanned({"affected": [finding()]}, "1", fixes)
+        self.assertIn(
+            "| `groq-retired-models-2026-08` | pull request opened "
+            "| [https://github.test/pr/7](https://github.test/pr/7) |",
+            md,
+        )
+        self.assertIn("| `other` | already has a branch | `tiltmeter/scan-other` |", md)
+        self.assertIn("| `bad` | failed | `[x](https://evil.test)` |", md)
+        self.assertIn("  fix other: already has a branch tiltmeter/scan-other", log)
+
+
+class ScanFix(unittest.TestCase):
+    def fixed(
+        self,
+        report: object,
+        *,
+        agent: str = "",
+        on_remote: tuple[str, ...] = (),
+        printed: object = None,
+        code: int = 0,
+    ) -> tuple[list[dict[str, object]], int, list[list[str]]]:
+        """What ``scan-fix`` wrote, its exit code and the `tiltmeter fix` commands it ran."""
+        ran: list[list[str]] = []
+
+        def fake(command: list[str], **_: object) -> object:
+            class Done:
+                returncode = 0
+                stdout = ""
+
+            done = Done()
+            if command[:2] == ["git", "ls-remote"]:
+                branch = command[-1].removeprefix("refs/heads/")
+                done.returncode = 0 if branch in on_remote else 2
+            else:
+                ran.append(command)
+                done.returncode = code
+                done.stdout = (
+                    printed if isinstance(printed, str) else json.dumps(printed)
+                )
+            return done
+
+        original = action.subprocess.run
+        action.subprocess.run = fake  # type: ignore[assignment]
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                results = Path(tmp) / "scan.json"
+                results.write_text(json.dumps(report), encoding="utf-8")
+                out = Path(tmp) / "fixes.json"
+                exit_code = 0
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        action.scan_fix(str(results), agent, str(out))
+                    except SystemExit as stop:
+                        exit_code = int(stop.code or 0)
+                return json.loads(out.read_text(encoding="utf-8")), exit_code, ran
+        finally:
+            action.subprocess.run = original
+
+    def test_each_change_that_counts_gets_one_fix_on_its_own_branch(self) -> None:
+        outcome = {"status": "opened", "pr_url": "https://github.test/pr/7"}
+        done, code, ran = self.fixed({"affected": [finding()]}, printed=outcome)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            done,
+            [
+                {
+                    "id": "groq-retired-models-2026-08",
+                    "status": "opened",
+                    "detail": "https://github.test/pr/7",
+                    "pr_url": "https://github.test/pr/7",
+                }
+            ],
+        )
+        [command] = ran
+        self.assertEqual(command[1:4], ["-m", "tiltmeter", "fix"])
+        self.assertEqual(
+            command[4:],
+            [
+                "--notice",
+                "groq-retired-models-2026-08",
+                "--allow-unsigned",
+                "--repo",
+                ".",
+                "--yes",
+                "--json",
+                "--branch",
+                "tiltmeter/scan-groq-retired-models-2026-08",
+            ],
+        )
+        _, _, ran = self.fixed(
+            {"affected": [finding()]}, agent="codex", printed=outcome
+        )
+        self.assertEqual(ran[0][-2:], ["--agent", "codex"])
+
+    def test_a_change_with_a_branch_on_origin_is_left_alone(self) -> None:
+        branch = "tiltmeter/scan-groq-retired-models-2026-08"
+        done, code, ran = self.fixed({"affected": [finding()]}, on_remote=(branch,))
+        self.assertEqual((code, ran), (0, []))
+        self.assertEqual(
+            done,
+            [
+                {
+                    "id": "groq-retired-models-2026-08",
+                    "status": "exists",
+                    "detail": branch,
+                }
+            ],
+        )
+
+    def test_what_does_not_count_or_cannot_be_fixed_is_not_tried(self) -> None:
+        report = {
+            "affected": [
+                finding(id="far", due=False),
+                finding(id="no-command", fix_command=None),
+                finding(id="a..b"),
+                finding(id="ends.lock"),
+                finding(id="-x"),
+                finding(id="x y; rm -rf"),
+            ]
+        }
+        done, code, ran = self.fixed(report, printed={"status": "opened"})
+        self.assertEqual((code, ran), (0, []))
+        self.assertEqual(
+            [(item["id"], item["status"]) for item in done],
+            [(name, "skipped") for name in ("a..b", "ends.lock", "-x", "x y; rm -rf")],
+        )
+
+    def test_a_fix_that_fails_is_worse_than_questions_for_a_human(self) -> None:
+        report = {"affected": [finding()]}
+        blocked, code, _ = self.fixed(report, printed={"status": "blocked"}, code=1)
+        self.assertEqual((blocked[0]["status"], code), ("blocked", 1))
+        failed, code, _ = self.fixed(report, printed="error: no API key", code=4)
+        self.assertEqual(
+            (failed[0]["status"], failed[0]["detail"], code),
+            ("failed", "see the step log", 3),
+        )
+        said = {"status": "unchanged", "error": "push rejected\n::error::pwned"}
+        failed, code, _ = self.fixed(report, printed=said, code=3)
+        self.assertEqual((failed[0]["status"], code), ("failed", 3))
+
+
+class Modes(unittest.TestCase):
+    def test_an_unknown_mode_names_the_ones_there_are(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                **os.environ,
+                "MODE": "scna",
+                "RUNNER_TEMP": tmp,
+                "PACKAGE": "tiltmeter",
+            }
+            done = subprocess.run(
+                ["bash", "-c", step("Run Tiltmeter")],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(done.returncode, 4)
+        self.assertIn(
+            "mode must be check, scan, notices, notice-draft or notice-publish",
+            done.stdout,
+        )
+
+    def test_scan_needs_no_baseline(self) -> None:
+        steps = yaml.safe_load((HERE / "action.yml").read_text(encoding="utf-8"))[
+            "runs"
+        ]["steps"]
+        for name in (
+            "Locate the baseline",
+            "Restore the baseline",
+            "Save the baseline",
+        ):
+            condition = next(s["if"] for s in steps if s.get("name") == name)
+            self.assertIn("inputs.mode != 'scan'", condition, name)
 
 
 if __name__ == "__main__":

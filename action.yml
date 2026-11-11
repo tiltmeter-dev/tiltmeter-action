@@ -1,5 +1,5 @@
 name: Tiltmeter API drift check
-description: Detect breaking changes in the third-party APIs your code and AI agents depend on, and apply the changes API providers announce.
+description: Detect breaking changes in the third-party APIs your code and AI agents depend on, find code that still uses what providers retired, and apply the changes they announce.
 author: Agustin Torres
 branding:
   icon: activity
@@ -8,7 +8,9 @@ branding:
 inputs:
   mode:
     description: >-
-      "check" checks the endpoints in the config for drift. "notices" reads the change
+      "check" checks the endpoints in the config for drift. "scan" searches the code, with
+      no config, for known API changes it still uses, such as retired models and removed
+      endpoints. "notices" reads the change
       notices and specs the config subscribes to and opens a pull request for each change
       that affects this repository. For API providers, "notice-draft" comments a draft
       notice on pull requests that change the spec's responses, and "notice-publish" signs
@@ -22,7 +24,7 @@ inputs:
     default: ""
   version:
     description: Tiltmeter version to run from PyPI. Pin it so a new release never changes your CI without a review.
-    default: "0.8.0"
+    default: "0.10.0"
   source:
     description: >-
       Install Tiltmeter from here instead of PyPI, such as
@@ -53,13 +55,35 @@ inputs:
     default: "true"
   agent:
     description: >-
-      With mode "notices": the agent that edits the code, deepagents, claude-code or codex.
-      Empty uses fix.agent from the config.
+      With mode "notices", or "scan" with fix: the agent that edits the code, deepagents,
+      claude-code or codex. Empty uses fix.agent from the config.
     default: ""
+  path:
+    description: With mode "scan", the folder to search, relative to the workspace.
+    default: "."
+  within:
+    description: >-
+      With mode "scan", count a change that has not taken effect yet only when it does
+      within this many days. Later ones are listed and do not fail the step. Empty counts
+      every change, however far away.
+    default: ""
+  fix:
+    description: >-
+      With mode "scan", "true" lets an agent adapt the code to each change that counts and
+      opens one pull request per change, once: a change that already has a branch is left
+      alone. Needs what mode "notices" needs: an agent, and a token that can push and open
+      pull requests.
+    default: "false"
+  code-scanning:
+    description: >-
+      With mode "scan", "true" uploads the findings to GitHub code scanning, where each
+      use shows up as an alert and on the pull request that adds it. The job needs the
+      permission security-events: write.
+    default: "false"
   token:
     description: >-
-      The token gh uses: to open pull requests with mode "notices", and to comment with
-      mode "notice-draft". Pull requests opened with the default GITHUB_TOKEN do not
+      The token gh uses: to open pull requests with mode "notices" or "scan" with fix,
+      and to comment with mode "notice-draft". Pull requests opened with the default GITHUB_TOKEN do not
       trigger other workflows; pass a GitHub App or fine-grained token to have your CI run
       on them.
     default: ${{ github.token }}
@@ -87,17 +111,21 @@ inputs:
 
 outputs:
   exit-code:
-    description: "Tiltmeter's exit code: 0 clean, 1 warning, 2 breaking, 3 a check or a fix failed, 4 configuration error."
+    description: "Tiltmeter's exit code: 0 clean, 1 warning, 2 breaking, 3 a check or a fix failed, 4 configuration error. With mode \"scan\", 1 means the code uses a known API change."
     value: ${{ steps.check.outputs.exit-code }}
   result:
-    description: "One word for the run: clean, warning, breaking, failed or error."
+    description: "One word for the run: clean, warning, breaking, failed or error. With mode \"scan\", affected in place of warning."
     value: ${{ steps.check.outputs.result }}
   json:
     description: >-
       Path to the JSON results: one check result per endpoint; with mode "notices", the
       feeds and what was done about each new notice; with "notice-draft", the draft
-      notice (empty when nothing changed); with "notice-publish", the feed.
+      notice (empty when nothing changed); with "notice-publish", the feed; with "scan",
+      the scan's report.
     value: ${{ steps.check.outputs.json }}
+  sarif:
+    description: With mode "scan", the path to the findings as SARIF 2.1.0.
+    value: ${{ steps.check.outputs.sarif }}
 
 runs:
   using: composite
@@ -122,6 +150,7 @@ runs:
 
     - name: Locate the baseline
       id: state
+      if: inputs.mode != 'scan'
       shell: bash
       env:
         CONFIG: ${{ inputs.config }}
@@ -131,7 +160,7 @@ runs:
 
     - name: Restore the baseline
       id: restore
-      if: inputs.cache == 'true' && !startsWith(inputs.mode, 'notice-')
+      if: inputs.cache == 'true' && !startsWith(inputs.mode, 'notice-') && inputs.mode != 'scan'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.state.outputs.dir }}
@@ -160,12 +189,31 @@ runs:
         SITE_DIR: ${{ inputs.site-dir }}
         REQUIRE_NOTICE: ${{ inputs.require-notice }}
         BASE_URL: ${{ inputs.base-url }}
+        SCAN_PATH: ${{ inputs.path }}
+        WITHIN: ${{ inputs.within }}
+        FIX: ${{ inputs.fix }}
       run: |
         json="$RUNNER_TEMP/tiltmeter-results.json"
+        sarif=""
         package="$PACKAGE"
         summary_command=summary
         tool() { uvx --quiet --from "$package" "$@"; }
         helper() { tool python "$GITHUB_ACTION_PATH/action.py" "$@"; }
+        # The agents: the built-in one needs the fix extra; Claude Code and Codex do not.
+        fix_package() {
+          case "$AGENT" in
+            claude-code|codex) ;;
+            *) package="$FIX_PACKAGE" ;;
+          esac
+        }
+        # Commits need an identity; use the Actions bot unless the job set one.
+        identity() {
+          if ! git config user.email >/dev/null; then
+            export GIT_AUTHOR_NAME="github-actions[bot]" GIT_COMMITTER_NAME="github-actions[bot]"
+            export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+            export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+          fi
+        }
         case "$MODE" in
           check)
             args=(check --json --config "$CONFIG")
@@ -173,20 +221,24 @@ runs:
             [ "$EXPLAIN" = "true" ] || args+=(--no-llm)
             [ "$NOTIFY" = "true" ] || args+=(--no-notify)
             ;;
+          scan)
+            json="$RUNNER_TEMP/tiltmeter-scan.json"
+            sarif="$RUNNER_TEMP/tiltmeter.sarif"
+            rm -f "$sarif"
+            case "$WITHIN" in
+              ""|*[!0-9]*)
+                [ -z "$WITHIN" ] || { echo "::error::within must be a number of days, got '$WITHIN'"; exit 4; }
+                ;;
+            esac
+            args=(scan "$SCAN_PATH" --json --sarif "$sarif")
+            [ -n "$WITHIN" ] && args+=(--within "$WITHIN")
+            summary_command=""
+            ;;
           notices)
             args=(notices apply --yes --json --config "$CONFIG" --repo .)
             [ -n "$AGENT" ] && args+=(--agent "$AGENT")
-            # The built-in agent needs the fix extra; Claude Code and Codex do not.
-            case "$AGENT" in
-              claude-code|codex) ;;
-              *) package="$FIX_PACKAGE" ;;
-            esac
-            # Commits need an identity; use the Actions bot unless the job set one.
-            if ! git config user.email >/dev/null; then
-              export GIT_AUTHOR_NAME="github-actions[bot]" GIT_COMMITTER_NAME="github-actions[bot]"
-              export GIT_AUTHOR_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
-              export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
-            fi
+            fix_package
+            identity
             summary_command=notices-summary
             ;;
           notice-draft)
@@ -233,14 +285,33 @@ runs:
             summary_command=""
             ;;
           *)
-            echo "::error::mode must be check, notices, notice-draft or notice-publish, got '$MODE'"
+            echo "::error::mode must be check, scan, notices, notice-draft or notice-publish, got '$MODE'"
             exit 4
             ;;
         esac
 
-        if [ "$MODE" = "check" ] || [ "$MODE" = "notices" ]; then
+        if [ "$MODE" = "check" ] || [ "$MODE" = "notices" ] || [ "$MODE" = "scan" ]; then
           code=0
           tool tiltmeter "${args[@]}" > "$json" || code=$?
+        fi
+
+        if [ "$MODE" = "scan" ]; then
+          [ -s "$sarif" ] || sarif=""
+          fixes=""
+          if [ "$FIX" = "true" ] && [ "$code" = "1" ]; then
+            fixes="$RUNNER_TEMP/tiltmeter-fixes.json"
+            rm -f "$fixes"
+            fix_package
+            identity
+            fixed=0
+            helper scan-fix "$json" "$AGENT" "$fixes" || fixed=$?
+            # A fix that failed is worse than a change in use; questions for a human are not.
+            if [ "$fixed" != "0" ] && [ "$fixed" != "1" ]; then code=3; fi
+            package="$PACKAGE"
+          fi
+          summary_file=""
+          [ "$SUMMARY" = "true" ] && summary_file="$GITHUB_STEP_SUMMARY"
+          helper scan-summary "$json" "$code" "$summary_file" "$fixes" "$SCAN_PATH"
         fi
 
         case "$code" in
@@ -250,10 +321,12 @@ runs:
           3) result=failed ;;
           *) result=error ;;
         esac
+        if [ "$MODE" = "scan" ] && [ "$code" = "1" ]; then result=affected; fi
         {
           echo "exit-code=$code"
           echo "result=$result"
           echo "json=$json"
+          echo "sarif=$sarif"
         } >> "$GITHUB_OUTPUT"
 
         summary_file=""
@@ -266,11 +339,18 @@ runs:
         fi
 
     - name: Save the baseline
-      if: always() && inputs.cache == 'true' && !startsWith(inputs.mode, 'notice-') && steps.check.outputs.exit-code != '4'
+      if: always() && inputs.cache == 'true' && !startsWith(inputs.mode, 'notice-') && inputs.mode != 'scan' && steps.check.outputs.exit-code != '4'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.state.outputs.dir }}
         key: ${{ inputs.cache-key }}-${{ github.job }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+    - name: Upload the findings to code scanning
+      if: always() && inputs.mode == 'scan' && inputs.code-scanning == 'true' && steps.check.outputs.sarif != ''
+      uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+      with:
+        sarif_file: ${{ steps.check.outputs.sarif }}
+        category: tiltmeter
 
     - name: Apply fail-on
       shell: bash

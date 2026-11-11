@@ -46,6 +46,85 @@ used for 7 days. Schedule the workflow more often than weekly: a run that finds 
 baseline records a new one and cannot report drift. It says so in the job summary and in
 a notice on the run, which is expected only the first time.
 
+## Scan for known API changes
+
+`mode: scan` needs no config, no API key and no baseline. It searches the code for the
+[known API changes](https://github.com/tiltmeter-dev/tiltmeter/blob/main/docs/scan.md)
+bundled with Tiltmeter, such as model ids a provider retired and endpoints it removed,
+and fails the job when the code still uses one. Add `.github/workflows/api-changes.yml`:
+
+```yaml
+name: API changes
+
+on:
+  schedule:
+    - cron: "23 7 * * 1"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write # for code-scanning
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: tiltmeter-dev/tiltmeter-action@v1
+        with:
+          mode: scan
+          within: 30
+          code-scanning: true
+```
+
+- Each use is annotated on its line in the run and in the pull request that adds it, the
+  first ten of each level: an error once the change is in effect, a warning while it is
+  ahead. The job summary lists every change with its date and the command that fixes it.
+- `within: 30` counts a change that has not taken effect yet only in its last 30 days.
+  Before that it is listed and does not fail the job. Without `within`, a change counts
+  as soon as the catalog knows it.
+- `code-scanning: true` also uploads the findings as SARIF, with
+  [`github/codeql-action/upload-sarif`](https://github.com/github/codeql-action), so each
+  use is an alert in the repository's Security tab until the code stops using it. It needs
+  `security-events: write`, and code scanning must be available for the repository
+  (public ones have it). Leave it out and drop the permission to only annotate.
+- `path` scans a folder of the repository instead of all of it.
+- The catalog comes with the Tiltmeter release in `version`: a newer release knows newer
+  changes. The entries are drafted by Tiltmeter from each provider's public documentation,
+  and no provider signed them.
+
+To also get the fix, add `fix: true`. For each change that counts, an agent adapts the
+code and the action opens one pull request, on the branch `tiltmeter/scan-<change id>`.
+A change whose branch already exists is left alone, so a weekly run opens each pull
+request once:
+
+```yaml
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: tiltmeter-dev/tiltmeter-action@v1
+        with:
+          mode: scan
+          within: 30
+          fix: true
+          fail-on: never # the pull requests carry the result
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+```
+
+What [`mode: notices`](#provider-notices) says about the token, the checkout's
+credentials and the agents holds here too. A fix that fails makes the result `failed`;
+delete the branch to have the next run try again.
+
 ## Provider notices
 
 When the APIs you call publish [change notices](https://github.com/tiltmeter-dev/tiltmeter/blob/main/docs/notices.md),
@@ -168,10 +247,10 @@ jobs:
 
 | Input | Default | Description |
 |---|---|---|
-| `mode` | `check` | `check` checks the endpoints for drift. `notices` applies the change notices and specs the config subscribes to. For providers, `notice-draft` comments a draft notice on pull requests that change the spec, and `notice-publish` signs `notices-dir` into the feed in `site-dir`. |
+| `mode` | `check` | `check` checks the endpoints for drift. `scan` searches the code for known API changes it still uses, with no config. `notices` applies the change notices and specs the config subscribes to. For providers, `notice-draft` comments a draft notice on pull requests that change the spec, and `notice-publish` signs `notices-dir` into the feed in `site-dir`. |
 | `config` | `tiltmeter.yaml` | Path to the config file, relative to the workspace. |
 | `endpoints` | all | Endpoint ids to check, separated by spaces or new lines. |
-| `version` | `0.8.0` | Tiltmeter version from PyPI. |
+| `version` | `0.10.0` | Tiltmeter version from PyPI. |
 | `source` | none | Run Tiltmeter from here instead of PyPI, such as `git+https://github.com/tiltmeter-dev/tiltmeter@main`. Overrides `version`. |
 | `fail-on` | `warning` | `warning` fails on warning or breaking drift and on checks that could not run. `breaking` fails only on breaking drift. `never` only reports. A broken config always fails. The provider modes have no drift to grade: with `notice-draft` and `notice-publish`, anything that goes wrong fails the step. |
 | `explain` | `true` | Ask Claude to explain drift. Needs `ANTHROPIC_API_KEY`; without it the check runs without explanations. |
@@ -179,8 +258,12 @@ jobs:
 | `cache` | `true` | Keep the baseline in the Actions cache. Without it nothing is ever reported. |
 | `cache-key` | `tiltmeter` | Cache key prefix. Change it when one job checks several independent configs, or to start over from a new baseline. |
 | `summary` | `true` | Write the results to the job summary: the changes of each endpoint, the explanation and notes such as a notification that failed. Text that comes from the API is shown as code. |
-| `agent` | config's `fix.agent` | With `mode: notices`: `deepagents`, `claude-code` or `codex`. The default agent needs `ANTHROPIC_API_KEY`; the other two need their CLI on the runner. |
-| `token` | `github.token` | The token `gh` uses: to open pull requests with `mode: notices`, and to comment with `mode: notice-draft`. |
+| `agent` | config's `fix.agent` | With `mode: notices`, or `mode: scan` with `fix`: `deepagents`, `claude-code` or `codex`. The default agent needs `ANTHROPIC_API_KEY`; the other two need their CLI on the runner. |
+| `path` | `.` | With `mode: scan`: the folder to search, relative to the workspace. |
+| `within` | none | With `mode: scan`: count a change that has not taken effect yet only when it does within this many days. Later ones are listed and do not fail the step. |
+| `fix` | `false` | With `mode: scan`: open one pull request per change that counts, once. Needs an agent and a token that can push and open pull requests. |
+| `code-scanning` | `false` | With `mode: scan`: upload the findings to GitHub code scanning. The job needs `security-events: write`. |
+| `token` | `github.token` | The token `gh` uses: to open pull requests with `mode: notices` or `mode: scan` with `fix`, and to comment with `mode: notice-draft`. |
 | `spec` | none | With `mode: notice-draft`: the path of your OpenAPI spec. |
 | `base-url` | the spec's server | With `mode: notice-draft`: the URL paths start from, when the spec's first server is relative or templated. |
 | `notices-dir` | `notices` | Where the provider keeps its notices, one JSON file each. |
@@ -191,9 +274,10 @@ jobs:
 
 | Output | Description |
 |---|---|
-| `exit-code` | `0` clean, `1` warning, `2` breaking, `3` a check or a fix could not run, `4` configuration error. With `mode: notices`, `1` means an agent left questions for a human. |
-| `result` | `clean`, `warning`, `breaking`, `failed` or `error`. |
-| `json` | Path to the JSON results: one check result per endpoint; the feeds and what was done about each new notice; the draft notice (`notice-draft`, empty when nothing changed); or the feed (`notice-publish`). |
+| `exit-code` | `0` clean, `1` warning, `2` breaking, `3` a check or a fix could not run, `4` configuration error. With `mode: notices`, `1` means an agent left questions for a human. With `mode: scan`, `1` means the code uses a known API change, and `3` that the catalog could not be read or a fix failed. |
+| `result` | `clean`, `warning`, `breaking`, `failed` or `error`. With `mode: scan`, `affected` in place of `warning`. |
+| `json` | Path to the JSON results: one check result per endpoint; the feeds and what was done about each new notice; the draft notice (`notice-draft`, empty when nothing changed); or the feed (`notice-publish`); or the scan's report (`scan`). |
+| `sarif` | With `mode: scan`: path to the findings as SARIF 2.1.0, to upload or keep as an artifact. |
 
 Use them to react in later steps, for example to open an issue on breaking drift:
 
@@ -214,8 +298,10 @@ Use them to react in later steps, for example to open an issue on breaking drift
 - **Pin it.** `@v1` follows compatible releases. For a fixed version, use a full commit
   SHA, and set `version` to the Tiltmeter release you reviewed.
 - **Runners.** Works on Linux, macOS and Windows runners. It uses
-  [`astral-sh/setup-uv`](https://github.com/astral-sh/setup-uv) and
-  [`actions/cache`](https://github.com/actions/cache), both pinned by commit SHA.
+  [`astral-sh/setup-uv`](https://github.com/astral-sh/setup-uv),
+  [`actions/cache`](https://github.com/actions/cache) and, for `code-scanning`,
+  [`github/codeql-action`](https://github.com/github/codeql-action), all pinned by commit
+  SHA.
 - **Secrets.** Credentials are passed through `env` and expanded by Tiltmeter at request
   time. They are never written to the cache, the summary or the logs. The cache holds only
   response shapes.

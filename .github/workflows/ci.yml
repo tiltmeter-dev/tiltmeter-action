@@ -110,3 +110,80 @@ jobs:
           JSON: ${{ steps.third.outputs.json }}
           OUTCOME: ${{ steps.third.outcome }}
         run: uv run --no-project python e2e/expect.py clean 0 --outcome success
+
+  # Scan mode needs no config and no API: a folder that still sends a retired model has
+  # to be found and fail the step, and a folder that uses nothing has to pass.
+  scan:
+    name: Scan mode (${{ matrix.os }}, Tiltmeter ${{ matrix.tiltmeter }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    continue-on-error: ${{ matrix.tiltmeter == 'main' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        tiltmeter: [released]
+        include:
+          - os: ubuntu-latest
+            tiltmeter: main
+    env:
+      SOURCE: ${{ matrix.tiltmeter == 'main' && 'git+https://github.com/tiltmeter-dev/tiltmeter@main' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: "First run: code that still sends a retired model"
+        id: found
+        continue-on-error: true
+        uses: ./
+        with:
+          mode: scan
+          path: e2e/scan
+          source: ${{ env.SOURCE }}
+      - name: The first run found it and failed
+        shell: bash
+        env:
+          RESULT: ${{ steps.found.outputs.result }}
+          CODE: ${{ steps.found.outputs.exit-code }}
+          JSON: ${{ steps.found.outputs.json }}
+          SARIF: ${{ steps.found.outputs.sarif }}
+          OUTCOME: ${{ steps.found.outcome }}
+        run: uv run --no-project python e2e/expect_scan.py affected 1 --outcome failure --finding groq-retired-models-2026-08 e2e/scan/app/llm.py
+
+      - name: "Second run: the same code, only reported"
+        id: reported
+        uses: ./
+        with:
+          mode: scan
+          path: e2e/scan
+          within: "30"
+          fail-on: never
+          source: ${{ env.SOURCE }}
+      - name: The second run reported it and passed
+        shell: bash
+        env:
+          RESULT: ${{ steps.reported.outputs.result }}
+          CODE: ${{ steps.reported.outputs.exit-code }}
+          JSON: ${{ steps.reported.outputs.json }}
+          SARIF: ${{ steps.reported.outputs.sarif }}
+          OUTCOME: ${{ steps.reported.outcome }}
+        run: uv run --no-project python e2e/expect_scan.py affected 1 --outcome success --finding groq-retired-models-2026-08 e2e/scan/app/llm.py
+
+      - name: "Third run: code with nothing to change"
+        id: clean
+        uses: ./
+        with:
+          mode: scan
+          path: e2e/clean
+          source: ${{ env.SOURCE }}
+      - name: The third run is clean
+        shell: bash
+        env:
+          RESULT: ${{ steps.clean.outputs.result }}
+          CODE: ${{ steps.clean.outputs.exit-code }}
+          JSON: ${{ steps.clean.outputs.json }}
+          SARIF: ${{ steps.clean.outputs.sarif }}
+          OUTCOME: ${{ steps.clean.outcome }}
+        run: uv run --no-project python e2e/expect_scan.py clean 0 --outcome success
